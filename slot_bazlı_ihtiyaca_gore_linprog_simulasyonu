@@ -1,0 +1,541 @@
+# =============================================================================
+# EYLÜL HAFTA SONU - LP DENGELİ DAĞILIM TESTLERİ
+# Slot bazlı kısıtlar - Min ve Max parametreli
+# =============================================================================
+
+import pandas as pd
+import numpy as np
+from scipy.optimize import linprog
+import matplotlib.pyplot as plt
+
+# =============================================================================
+# 0. VERİ YÜKLEME
+# =============================================================================
+
+print("Veriler yükleniyor...")
+
+df_shifts = pd.read_excel('vardiyalar.xlsx')
+df_actual = pd.read_excel('gercek_calisanlar.xlsx')
+df_actual['working_date'] = pd.to_datetime(df_actual['working_date'])
+
+print(f"✓ Shift sayısı: {len(df_shifts)}")
+print(f"✓ Gerçek çalışan satır: {len(df_actual):,}")
+
+queue_company_rules = {
+    'a_cagrilari': ['inhouse', 'outsource'],
+    'b_cagrilari': ['inhouse'],
+    'c_cagrilari': ['inhouse']
+}
+
+# =============================================================================
+# 1. YARDIMCI FONKSİYONLAR
+# =============================================================================
+
+def is_slot_in_shift(slot, start, end):
+    """Slot bu shift içinde mi?"""
+    if start <= end:
+        return start <= slot < end
+    else:
+        return slot >= start or slot < end
+
+
+def create_shift_coverage_matrix(df_shifts):
+    """Her shift'in hangi slotları kapsadığını hesapla"""
+    shift_coverage = {}
+    
+    for _, row in df_shifts.iterrows():
+        shift = row['shift']
+        start = str(row['start'])[:5]
+        end = str(row['end'])[:5]
+        company = row['company']
+        
+        key = f"{shift}_{company}"
+        
+        slots = []
+        for h in range(24):
+            for m in ['00', '30']:
+                slot = f"{h:02d}:{m}"
+                if is_slot_in_shift(slot, start, end):
+                    slots.append(slot)
+        
+        shift_coverage[key] = {
+            'shift': shift,
+            'company': company,
+            'start': start,
+            'end': end,
+            'slots': slots
+        }
+    
+    return shift_coverage
+
+
+def calculate_shift_slot_matrix(shift_coverage):
+    """Shift-Slot binary matrisi"""
+    slots = [f"{h:02d}:{m}" for h in range(24) for m in ['00', '30']]
+    shifts = list(shift_coverage.keys())
+    
+    matrix = pd.DataFrame(0, index=slots, columns=shifts)
+    
+    for shift_key, info in shift_coverage.items():
+        for slot in info['slots']:
+            matrix.loc[slot, shift_key] = 1
+    
+    return matrix
+
+
+def calculate_actual_by_slot(df_actual, date, queue):
+    """Belirli gün ve kuyruk için slot bazında gerçek çalışan"""
+    df_day = df_actual[df_actual['working_date'] == date]
+    df_day = df_day[df_day['line_based_main_group'] == queue]
+    
+    slots = [f"{h:02d}:{m}" for h in range(24) for m in ['00', '30']]
+    actual_by_slot = {}
+    
+    for slot in slots:
+        count = 0
+        for _, row in df_day.iterrows():
+            start = str(row['shifts_start_hour'])[:5]
+            end = str(row['shifts_end_hour'])[:5]
+            
+            if is_slot_in_shift(slot, start, end):
+                count += row['calisan_kisi_sayisi']
+        
+        actual_by_slot[slot] = count
+    
+    return actual_by_slot
+
+
+# =============================================================================
+# 2. LP FONKSİYONU (SLOT BAZLI MIN + MAX)
+# =============================================================================
+
+def optimize_shift_distribution(need_by_slot, df_shift_matrix, 
+                                 cost_multiplier=None,
+                                 min_outsource_ratio=None,
+                                 max_outsource_ratio=None):
+    """
+    LP ile shift dağılımı - SLOT BAZLI kısıtlar
+    
+    Parameters:
+    -----------
+    need_by_slot : dict
+        Her slot için ihtiyaç {slot: count}
+    df_shift_matrix : DataFrame
+        Shift-slot kapsama matrisi
+    cost_multiplier : dict
+        {'inhouse': 1.0, 'outsource': 1.05}
+    min_outsource_ratio : float
+        Her slotta outsource minimum oranı (örn: 0.55)
+    max_outsource_ratio : float
+        Her slotta outsource maksimum oranı (örn: 0.60)
+    """
+    
+    if cost_multiplier is None:
+        cost_multiplier = {'inhouse': 1.0, 'outsource': 1.0}
+    
+    slots = df_shift_matrix.index.tolist()
+    shifts = df_shift_matrix.columns.tolist()
+    
+    active_slots = [s for s in slots if s in need_by_slot and need_by_slot[s] > 0]
+    
+    if not active_slots:
+        return None
+    
+    # Shift'leri ayır
+    inhouse_shifts = [s for s in shifts if '_inhouse' in s.lower()]
+    outsource_shifts = [s for s in shifts if '_outsource' in s.lower()]
+    
+    # Maliyet vektörü
+    c = []
+    for shift in shifts:
+        if shift in inhouse_shifts:
+            c.append(cost_multiplier['inhouse'])
+        else:
+            c.append(cost_multiplier['outsource'])
+    
+    A_ub = []
+    b_ub = []
+    
+    # ============================================
+    # 1. İHTIYAÇ KISITLARI (Her slot için)
+    # ============================================
+    
+    for slot in active_slots:
+        constraint = [-1 if df_shift_matrix.loc[slot, shift] == 1 else 0 
+                      for shift in shifts]
+        A_ub.append(constraint)
+        b_ub.append(-need_by_slot[slot])
+    
+    # ============================================
+    # 2. OUTSOURCE MAKSIMUM KISITI (Her slot için)
+    # ============================================
+    
+    if max_outsource_ratio is not None:
+        for slot in active_slots:
+            need = need_by_slot[slot]
+            
+            # Bu slotta çalışan outsource shift'lerin index'leri
+            outsource_in_slot = [i for i, shift in enumerate(shifts)
+                                if shift in outsource_shifts 
+                                and df_shift_matrix.loc[slot, shift] == 1]
+            
+            if outsource_in_slot:
+                constraint = [0] * len(shifts)
+                for idx in outsource_in_slot:
+                    constraint[idx] = 1
+                
+                A_ub.append(constraint)
+                b_ub.append(max_outsource_ratio * need)
+    
+    # ============================================
+    # 3. OUTSOURCE MİNİMUM KISITI (Her slot için)
+    # ============================================
+    
+    if min_outsource_ratio is not None:
+        for slot in active_slots:
+            need = need_by_slot[slot]
+            
+            # Bu slotta çalışan outsource shift'lerin index'leri
+            outsource_in_slot = [i for i, shift in enumerate(shifts)
+                                if shift in outsource_shifts 
+                                and df_shift_matrix.loc[slot, shift] == 1]
+            
+            if outsource_in_slot:
+                constraint = [0] * len(shifts)
+                for idx in outsource_in_slot:
+                    constraint[idx] = -1  # Negatif (>= için)
+                
+                A_ub.append(constraint)
+                b_ub.append(-min_outsource_ratio * need)  # Negatif
+    
+    # ============================================
+    # 4. İNHOUSE MİNİMUM KISITI (Opsiyonel - sadece max varsa)
+    # ============================================
+    
+    # Eğer sadece max_ratio varsa, inhouse min otomatik hesapla
+    if max_outsource_ratio is not None and min_outsource_ratio is None:
+        for slot in active_slots:
+            need = need_by_slot[slot]
+            
+            # Bu slotta çalışan inhouse shift'lerin index'leri
+            inhouse_in_slot = [i for i, shift in enumerate(shifts)
+                              if shift in inhouse_shifts 
+                              and df_shift_matrix.loc[slot, shift] == 1]
+            
+            if inhouse_in_slot:
+                constraint = [0] * len(shifts)
+                for idx in inhouse_in_slot:
+                    constraint[idx] = -1
+                
+                A_ub.append(constraint)
+                b_ub.append(-(1 - max_outsource_ratio) * need)
+    
+    # ============================================
+    # 5. LP ÇÖZÜMÜ
+    # ============================================
+    
+    bounds = [(0, 100)] * len(shifts)
+    
+    result = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+    
+    if result.success:
+        assignments = {}
+        for i, shift in enumerate(shifts):
+            val = result.x[i]
+            if val > 0.01:
+                assignments[shift] = int(np.ceil(val))
+        return assignments
+    else:
+        return None
+
+
+def analyze_lp_result(lp_assignments, shift_coverage, df_shift_matrix, actual_by_slot):
+    """LP sonucunu analiz et"""
+    
+    if lp_assignments is None:
+        return None
+    
+    # Slot bazında company dağılımı
+    company_by_slot = {'inhouse': {}, 'outsource': {}}
+    
+    for slot in df_shift_matrix.index:
+        inhouse_total = 0
+        outsource_total = 0
+        
+        for shift, count in lp_assignments.items():
+            if shift in shift_coverage and df_shift_matrix.loc[slot, shift] == 1:
+                info = shift_coverage[shift]
+                if info['company'] == 'inhouse':
+                    inhouse_total += count
+                else:
+                    outsource_total += count
+        
+        company_by_slot['inhouse'][slot] = inhouse_total
+        company_by_slot['outsource'][slot] = outsource_total
+    
+    # Günlük toplam
+    total_inhouse = sum([count for shift, count in lp_assignments.items() 
+                         if shift in shift_coverage and shift_coverage[shift]['company'] == 'inhouse'])
+    total_outsource = sum([count for shift, count in lp_assignments.items() 
+                           if shift in shift_coverage and shift_coverage[shift]['company'] == 'outsource'])
+    
+    total = total_inhouse + total_outsource
+    
+    # Zirve slot
+    if actual_by_slot:
+        max_slot = max(actual_by_slot.items(), key=lambda x: x[1])[0]
+        inhouse_peak = company_by_slot['inhouse'].get(max_slot, 0)
+        outsource_peak = company_by_slot['outsource'].get(max_slot, 0)
+    else:
+        max_slot = None
+        inhouse_peak = 0
+        outsource_peak = 0
+    
+    return {
+        'total': total,
+        'inhouse': total_inhouse,
+        'outsource': total_outsource,
+        'inhouse_pct': total_inhouse / total * 100 if total > 0 else 0,
+        'outsource_pct': total_outsource / total * 100 if total > 0 else 0,
+        'peak_slot': max_slot,
+        'peak_inhouse': inhouse_peak,
+        'peak_outsource': outsource_peak,
+        'peak_inhouse_pct': inhouse_peak / (inhouse_peak + outsource_peak) * 100 if (inhouse_peak + outsource_peak) > 0 else 0,
+        'peak_outsource_pct': outsource_peak / (inhouse_peak + outsource_peak) * 100 if (inhouse_peak + outsource_peak) > 0 else 0,
+        'company_by_slot': company_by_slot
+    }
+
+
+# =============================================================================
+# 3. EYLÜL VERİLERİNİ HAZIRLA
+# =============================================================================
+
+queue = 'a_cagrilari'
+
+df_eylul = df_actual[df_actual['working_date'].dt.month == 9]
+
+weekend_dates = df_eylul[
+    (df_eylul['line_based_main_group'] == queue) & 
+    (df_eylul['weekend_flg'] == 1)
+]['working_date'].unique()
+
+print(f"\n{'='*60}")
+print("EYLÜL HAFTA SONU")
+print(f"{'='*60}")
+print(f"Hafta sonu günü: {len(weekend_dates)}")
+
+df_shifts_filtered = df_shifts[df_shifts['company'].isin(queue_company_rules[queue])]
+shift_coverage = create_shift_coverage_matrix(df_shifts_filtered)
+df_shift_matrix = calculate_shift_slot_matrix(shift_coverage)
+
+print(f"\nKullanılabilir Shift: {len(shift_coverage)}")
+print(f"  Inhouse: {sum([1 for s in shift_coverage.values() if s['company']=='inhouse'])}")
+print(f"  Outsource: {sum([1 for s in shift_coverage.values() if s['company']=='outsource'])}")
+
+# =============================================================================
+# 4. TEST SENARYOLARI
+# =============================================================================
+
+test_scenarios = [
+    {
+        'name': 'Test 1: Kısıt Yok (Baseline)',
+        'cost_mult': {'inhouse': 1.0, 'outsource': 1.0},
+        'min_ratio': None,
+        'max_ratio': None
+    },
+    {
+        'name': 'Test 2: Maliyet +%0.5',
+        'cost_mult': {'inhouse': 1.0, 'outsource': 1.005},
+        'min_ratio': None,
+        'max_ratio': None
+    },
+    {
+        'name': 'Test 3: Maliyet +%1',
+        'cost_mult': {'inhouse': 1.0, 'outsource': 1.01},
+        'min_ratio': None,
+        'max_ratio': None
+    },
+    {
+        'name': 'Test 4: Max %60',
+        'cost_mult': {'inhouse': 1.0, 'outsource': 1.0},
+        'min_ratio': None,
+        'max_ratio': 0.60
+    },
+    {
+        'name': 'Test 5: Max %65',
+        'cost_mult': {'inhouse': 1.0, 'outsource': 1.0},
+        'min_ratio': None,
+        'max_ratio': 0.65
+    },
+    {
+        'name': 'Test 6: Max %70',
+        'cost_mult': {'inhouse': 1.0, 'outsource': 1.0},
+        'min_ratio': None,
+        'max_ratio': 0.70
+    },
+    {
+        'name': 'Test 7: Max %55',
+        'cost_mult': {'inhouse': 1.0, 'outsource': 1.0},
+        'min_ratio': None,
+        'max_ratio': 0.55
+    },
+    {
+        'name': 'Test 8: Min %50 + Max %60',
+        'cost_mult': {'inhouse': 1.0, 'outsource': 1.0},
+        'min_ratio': 0.50,
+        'max_ratio': 0.60
+    },
+    {
+        'name': 'Test 9: Min %52 + Max %58',
+        'cost_mult': {'inhouse': 1.0, 'outsource': 1.0},
+        'min_ratio': 0.52,
+        'max_ratio': 0.58
+    },
+    {
+        'name': 'Test 10: Min %55 + Max %60',
+        'cost_mult': {'inhouse': 1.0, 'outsource': 1.0},
+        'min_ratio': 0.55,
+        'max_ratio': 0.60
+    },
+    {
+        'name': 'Test 11: Min %55 + Max %65',
+        'cost_mult': {'inhouse': 1.0, 'outsource': 1.0},
+        'min_ratio': 0.55,
+        'max_ratio': 0.65
+    },
+    {
+        'name': 'Test 12: Min %50',
+        'cost_mult': {'inhouse': 1.0, 'outsource': 1.0},
+        'min_ratio': 0.50,
+        'max_ratio': None
+    },
+    {
+        'name': 'Test 13: Min %55',
+        'cost_mult': {'inhouse': 1.0, 'outsource': 1.0},
+        'min_ratio': 0.55,
+        'max_ratio': None
+    },
+]
+
+# =============================================================================
+# 5. TESTLERİ ÇALIŞTIR
+# =============================================================================
+
+all_results = []
+
+for scenario in test_scenarios:
+    print(f"\n{'='*80}")
+    print(scenario['name'])
+    print(f"{'='*80}")
+    
+    scenario_results = []
+    
+    for date in weekend_dates:
+        actual_by_slot = calculate_actual_by_slot(df_actual, date, queue)
+        
+        lp_assignments = optimize_shift_distribution(
+            actual_by_slot, 
+            df_shift_matrix,
+            cost_multiplier=scenario['cost_mult'],
+            min_outsource_ratio=scenario.get('min_ratio'),
+            max_outsource_ratio=scenario.get('max_ratio')
+        )
+        
+        if lp_assignments:
+            analysis = analyze_lp_result(lp_assignments, shift_coverage, df_shift_matrix, actual_by_slot)
+            if analysis:
+                scenario_results.append({
+                    'date': date,
+                    'analysis': analysis
+                })
+    
+    if scenario_results:
+        avg_outsource_pct = np.mean([r['analysis']['outsource_pct'] for r in scenario_results])
+        avg_peak_outsource_pct = np.mean([r['analysis']['peak_outsource_pct'] for r in scenario_results])
+        
+        print(f"\n📊 SONUÇLAR ({len(scenario_results)} gün):")
+        print(f"   Günlük Ort. Outsource: %{avg_outsource_pct:.1f}")
+        print(f"   Zirve Slot Outsource: %{avg_peak_outsource_pct:.1f}")
+        
+        all_results.append({
+            'scenario': scenario['name'],
+            'avg_outsource_pct': avg_outsource_pct,
+            'avg_peak_outsource_pct': avg_peak_outsource_pct,
+            'results': scenario_results
+        })
+    else:
+        print("   ⚠️ Çözüm bulunamadı!")
+        all_results.append({
+            'scenario': scenario['name'],
+            'avg_outsource_pct': None,
+            'avg_peak_outsource_pct': None,
+            'results': []
+        })
+
+# =============================================================================
+# 6. KARŞILAŞTIRMA TABLOSU
+# =============================================================================
+
+print(f"\n{'='*80}")
+print("KARŞILAŞTIRMA TABLOSU")
+print(f"{'='*80}")
+
+print(f"\n{'Senaryo':<40} {'Günlük Ort.':<15} {'Zirve Slot':<15}")
+print(f"{'-'*40} {'-'*15} {'-'*15}")
+print(f"{'GERÇEK DURUM (Eylül)':<40} {'%55':<15} {'%60':<15}")
+print(f"{'-'*40} {'-'*15} {'-'*15}")
+
+for result in all_results:
+    name = result['scenario']
+    if result['avg_outsource_pct'] is not None:
+        daily = f"%{result['avg_outsource_pct']:.1f}"
+        peak = f"%{result['avg_peak_outsource_pct']:.1f}"
+    else:
+        daily = "Çözüm yok"
+        peak = "Çözüm yok"
+    
+    print(f"{name:<40} {daily:<15} {peak:<15}")
+
+# =============================================================================
+# 7. GRAFİKLER
+# =============================================================================
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+# Grafik 1: Günlük Ortalama
+ax1 = axes[0]
+scenarios_with_results = [r for r in all_results if r['avg_outsource_pct'] is not None]
+scenarios_names = [r['scenario'].replace('Test ', 'T') for r in scenarios_with_results]
+daily_values = [r['avg_outsource_pct'] for r in scenarios_with_results]
+
+bars1 = ax1.bar(range(len(scenarios_names)), daily_values, color='#A23B72', alpha=0.7)
+ax1.axhline(y=55, color='red', linestyle='--', label='Gerçek (%55)', linewidth=2)
+ax1.axhline(y=45, color='green', linestyle='--', label='Hedef Alt (%45)', linewidth=2)
+ax1.axhline(y=60, color='orange', linestyle='--', label='Hedef Üst (%60)', linewidth=2)
+
+ax1.set_ylabel('Outsource Oranı (%)')
+ax1.set_title('Günlük Ortalama Outsource Oranı', fontweight='bold')
+ax1.set_xticks(range(len(scenarios_names)))
+ax1.set_xticklabels(scenarios_names, rotation=45, ha='right', fontsize=8)
+ax1.legend()
+ax1.grid(axis='y', alpha=0.3)
+
+# Grafik 2: Zirve Slot
+ax2 = axes[1]
+peak_values = [r['avg_peak_outsource_pct'] for r in scenarios_with_results]
+
+bars2 = ax2.bar(range(len(scenarios_names)), peak_values, color='#2E86AB', alpha=0.7)
+ax2.axhline(y=60, color='red', linestyle='--', label='Gerçek (%60)', linewidth=2)
+ax2.axhline(y=45, color='green', linestyle='--', label='Hedef Alt (%45)', linewidth=2)
+
+ax2.set_ylabel('Outsource Oranı (%)')
+ax2.set_title('Zirve Slot Outsource Oranı', fontweight='bold')
+ax2.set_xticks(range(len(scenarios_names)))
+ax2.set_xticklabels(scenarios_names, rotation=45, ha='right', fontsize=8)
+ax2.legend()
+ax2.grid(axis='y', alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+print("\n✓ Testler tamamlandı!")
