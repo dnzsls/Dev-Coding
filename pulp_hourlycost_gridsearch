@@ -1,0 +1,1017 @@
+# =============================================================================
+# EYLÜL HAFTA SONU - MIP İLE SHIFT OPTİMİZASYONU
+# Grup bazlı dengeleme + Grid Search
+# =============================================================================
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from pulp import *
+import itertools
+
+# =============================================================================
+# 0. VERİ YÜKLEME
+# =============================================================================
+
+print("Veriler yükleniyor...")
+
+df_shifts = pd.read_excel('vardiyalar.xlsx')
+df_actual = pd.read_excel('gercek_calisanlar.xlsx')
+df_actual['working_date'] = pd.to_datetime(df_actual['working_date'])
+
+print(f"✓ Shift sayısı: {len(df_shifts)}")
+print(f"✓ Gerçek çalışan satır: {len(df_actual):,}")
+
+queue_company_rules = {
+    'a_cagrilari': ['inhouse', 'outsource'],
+    'b_cagrilari': ['inhouse'],
+    'c_cagrilari': ['inhouse']
+}
+
+# =============================================================================
+# 1. YARDIMCI FONKSİYONLAR
+# =============================================================================
+
+def is_slot_in_shift(slot, start, end):
+    """Slot bu shift içinde mi?"""
+    if start <= end:
+        return start <= slot < end
+    else:
+        return slot >= start or slot < end
+
+
+def create_shift_coverage_matrix(df_shifts):
+    """Her shift'in hangi slotları kapsadığını hesapla"""
+    shift_coverage = {}
+    
+    for _, row in df_shifts.iterrows():
+        shift = row['shift']
+        start = str(row['start'])[:5]
+        end = str(row['end'])[:5]
+        company = row['company']
+        
+        key = f"{shift}_{company}"
+        
+        slots = []
+        for h in range(24):
+            for m in ['00', '30']:
+                slot = f"{h:02d}:{m}"
+                if is_slot_in_shift(slot, start, end):
+                    slots.append(slot)
+        
+        shift_coverage[key] = {
+            'shift': shift,
+            'company': company,
+            'start': start,
+            'end': end,
+            'slots': slots
+        }
+    
+    return shift_coverage
+
+
+def calculate_actual_by_slot(df_actual, date, queue):
+    """Belirli gün ve kuyruk için slot bazında gerçek çalışan (TOPLAM)"""
+    df_day = df_actual[
+        (df_actual['working_date'] == date) &
+        (df_actual['line_based_main_group'] == queue)
+    ]
+    
+    slots = [f"{h:02d}:{m}" for h in range(24) for m in ['00', '30']]
+    actual_by_slot = {}
+    
+    for slot in slots:
+        count = 0
+        for _, row in df_day.iterrows():
+            start = str(row['shifts_start_hour'])[:5]
+            end = str(row['shifts_end_hour'])[:5]
+            
+            if is_slot_in_shift(slot, start, end):
+                count += row['calisan_kisi_sayisi']
+        
+        actual_by_slot[slot] = count
+    
+    return actual_by_slot
+
+
+def calculate_actual_by_slot_by_company(df_actual, date, queue):
+    """Slot bazında inhouse/outsource ayrı hesapla"""
+    df_day = df_actual[
+        (df_actual['working_date'] == date) &
+        (df_actual['line_based_main_group'] == queue)
+    ]
+    
+    slots = [f"{h:02d}:{m}" for h in range(24) for m in ['00', '30']]
+    
+    actual_inhouse = {}
+    actual_outsource = {}
+    
+    for slot in slots:
+        count_in = 0
+        count_out = 0
+        
+        for _, row in df_day.iterrows():
+            start = str(row['shifts_start_hour'])[:5]
+            end = str(row['shifts_end_hour'])[:5]
+            
+            if is_slot_in_shift(slot, start, end):
+                if row['outsource_flg'] == 0:
+                    count_in += row['calisan_kisi_sayisi']
+                else:
+                    count_out += row['calisan_kisi_sayisi']
+        
+        actual_inhouse[slot] = count_in
+        actual_outsource[slot] = count_out
+    
+    return actual_inhouse, actual_outsource
+
+
+def calculate_actual_by_start_hour(df_actual, date, queue):
+    """Vardiya başlangıç saatine göre inhouse/outsource kişi sayısı"""
+    df_day = df_actual[
+        (df_actual['working_date'] == date) &
+        (df_actual['line_based_main_group'] == queue)
+    ]
+    
+    actual_inhouse_start = {}
+    actual_outsource_start = {}
+    
+    for _, row in df_day.iterrows():
+        start = str(row['shifts_start_hour'])[:5]
+        count = row['calisan_kisi_sayisi']
+        
+        if row['outsource_flg'] == 0:
+            actual_inhouse_start[start] = actual_inhouse_start.get(start, 0) + count
+        else:
+            actual_outsource_start[start] = actual_outsource_start.get(start, 0) + count
+    
+    return actual_inhouse_start, actual_outsource_start
+
+
+# =============================================================================
+# 2. MIP OPTİMİZASYON FONKSİYONU (GRUP BAZLI DENGELEME)
+# =============================================================================
+
+def optimize_shifts_mip(need_by_slot, shift_coverage, 
+                        target_min_outsource=0.55,
+                        target_max_outsource=0.65,
+                        min_per_shift=5,
+                        cost_inhouse=1.0,
+                        cost_outsource=1.01,
+                        balance_weight=10,
+                        shift_cost_overrides=None):
+    """
+    MIP ile shift optimizasyonu - Grup bazlı dengeleme
+    
+    Parameters:
+    -----------
+    need_by_slot : dict
+        Her slot için ihtiyaç {slot: count}
+    shift_coverage : dict
+        Her shift'in bilgisi
+    target_min_outsource : float
+        Günlük minimum outsource oranı
+    target_max_outsource : float
+        Günlük maksimum outsource oranı
+    min_per_shift : int
+        Bir shift kullanılıyorsa minimum kişi sayısı
+    cost_inhouse : float
+        Inhouse maliyet çarpanı
+    cost_outsource : float
+        Outsource maliyet çarpanı
+    balance_weight : float
+        Dengeleme ağırlığı (0=dengeleme yok, 10=orta, 50=güçlü)
+    shift_cost_overrides : dict
+        Belirli saatler için özel maliyet tanımları
+        Örnek: {'07:30': {'inhouse': 1.05}, '19:00': {'outsource': 1.15}}
+    """
+    
+    if shift_cost_overrides is None:
+        shift_cost_overrides = {}
+    
+    prob = LpProblem("Shift_Optimization", LpMinimize)
+    
+    shifts = list(shift_coverage.keys())
+    slots = [f"{h:02d}:{m}" for h in range(24) for m in ['00', '30']]
+    active_slots = [s for s in slots if need_by_slot.get(s, 0) > 0]
+    
+    inhouse_shifts = []
+    for s in shifts:
+        if '_inhouse' in s.lower():
+            inhouse_shifts.append(s)
+    
+    outsource_shifts = []
+    for s in shifts:
+        if '_outsource' in s.lower():
+            outsource_shifts.append(s)
+    
+    # =========================================
+    # VARDIYA BAŞLANGIÇ GRUPLARI
+    # =========================================
+    
+    shift_groups = {
+        'sabah': ['07:00', '07:30', '08:00', '08:30', '09:00'],
+        'gunduz': ['09:30', '10:00', '10:30', '11:00'],
+        'ara': ['11:30', '12:00', '12:30', '13:00', '13:30', '14:00', '14:30', '15:00', '15:30', '16:00', '16:30'],
+        'aksam': ['17:00', '18:00', '19:00'],
+        'gece': ['00:00', '01:00', '02:00', '03:00', '04:00', '05:00', '06:00', '06:30']
+    }
+    
+    # Her gruptaki shift'leri bul
+    group_shifts = {}
+    for group_name, start_hours in shift_groups.items():
+        group_shifts[group_name] = []
+        for s in shifts:
+            if shift_coverage[s]['start'] in start_hours:
+                group_shifts[group_name].append(s)
+    
+    # =========================================
+    # DEĞİŞKENLER
+    # =========================================
+    
+    # x[shift] = bu shift'e atanan kişi sayısı (integer)
+    x = LpVariable.dicts("x", shifts, lowBound=0, cat='Integer')
+    
+    # y[shift] = bu shift kullanılıyor mu? (binary)
+    y = LpVariable.dicts("y", shifts, cat='Binary')
+    
+    # z_group[group] = her gruptaki maksimum shift kişi sayısı
+    z_group = {}
+    for group_name in shift_groups.keys():
+        z_group[group_name] = LpVariable(f"z_{group_name}", lowBound=0)
+    
+    # =========================================
+    # AMAÇ FONKSİYONU
+    # =========================================
+    
+    # Toplam maliyet (esnek maliyet hesaplama)
+    cost_list = []
+    for s in shifts:
+        start = shift_coverage[s]['start']
+        company = shift_coverage[s]['company']
+        
+        # Varsayılan maliyet
+        if company == 'inhouse':
+            base_cost = cost_inhouse
+        else:
+            base_cost = cost_outsource
+        
+        # Override var mı kontrol et
+        if start in shift_cost_overrides:
+            if company in shift_cost_overrides[start]:
+                base_cost = shift_cost_overrides[start][company]
+        
+        cost_list.append(x[s] * base_cost)
+    
+    total_cost = lpSum(cost_list)
+    
+    # Dengeleme cezası (grup max'larının toplamı)
+    balance_penalty = lpSum([z_group[g] for g in shift_groups.keys()])
+    
+    # Amaç: maliyet + dengeleme
+    prob += total_cost + balance_weight * balance_penalty
+    
+    # =========================================
+    # KISITLAR
+    # =========================================
+    
+    # 1. Her slotta ihtiyacı karşıla
+    for slot in active_slots:
+        covering_shifts = []
+        for s in shifts:
+            if slot in shift_coverage[s]['slots']:
+                covering_shifts.append(s)
+        
+        if len(covering_shifts) > 0:
+            slot_sum = 0
+            for s in covering_shifts:
+                slot_sum += x[s]
+            prob += slot_sum >= need_by_slot[slot]
+    
+    # 2. Shift kullanılıyorsa en az min_per_shift kişi
+    M = 200
+    for s in shifts:
+        prob += x[s] <= M * y[s]
+        prob += x[s] >= min_per_shift * y[s]
+    
+    # 3. Günlük outsource oranı
+    total_inhouse = 0
+    for s in inhouse_shifts:
+        total_inhouse += x[s]
+    
+    total_outsource = 0
+    for s in outsource_shifts:
+        total_outsource += x[s]
+    
+    prob += (1 - target_min_outsource) * total_outsource >= target_min_outsource * total_inhouse
+    prob += (1 - target_max_outsource) * total_outsource <= target_max_outsource * total_inhouse
+    
+    # 4. Her slotta en az 1 inhouse
+    for slot in active_slots:
+        covering_inhouse = []
+        for s in inhouse_shifts:
+            if slot in shift_coverage[s]['slots']:
+                covering_inhouse.append(s)
+        
+        if len(covering_inhouse) > 0:
+            inhouse_sum = 0
+            for s in covering_inhouse:
+                inhouse_sum += x[s]
+            prob += inhouse_sum >= 1
+    
+    # 5. Grup içi dengeleme: her shift kendi grubunun max'ından küçük olsun
+    for group_name, shift_list in group_shifts.items():
+        for s in shift_list:
+            prob += x[s] <= z_group[group_name]
+    
+    # =========================================
+    # ÇÖZÜM
+    # =========================================
+    
+    prob.solve(PULP_CBC_CMD(msg=0))
+    
+    if LpStatus[prob.status] == 'Optimal':
+        assignments = {}
+        for s in shifts:
+            val = value(x[s])
+            if val and val > 0:
+                assignments[s] = int(val)
+        
+        # Özet hesapla
+        total_in = 0
+        for s in assignments.keys():
+            if s in inhouse_shifts:
+                total_in += assignments[s]
+        
+        total_out = 0
+        for s in assignments.keys():
+            if s in outsource_shifts:
+                total_out += assignments[s]
+        
+        if (total_in + total_out) > 0:
+            ratio = total_out / (total_in + total_out)
+        else:
+            ratio = 0
+        
+        # Grup max'larını al
+        group_maxes = {}
+        for g in shift_groups.keys():
+            group_maxes[g] = value(z_group[g])
+        
+        return assignments, f"Optimal (outsource: {ratio:.1%})", group_maxes
+    else:
+        return None, LpStatus[prob.status], None
+
+
+# =============================================================================
+# 3. ANALİZ FONKSİYONU
+# =============================================================================
+
+def analyze_mip_result(assignments, shift_coverage, need_by_slot):
+    """MIP sonucunu analiz et"""
+    
+    if assignments is None:
+        return None
+    
+    slots = [f"{h:02d}:{m}" for h in range(24) for m in ['00', '30']]
+    
+    inhouse_shifts = []
+    for s in assignments.keys():
+        if '_inhouse' in s.lower():
+            inhouse_shifts.append(s)
+    
+    outsource_shifts = []
+    for s in assignments.keys():
+        if '_outsource' in s.lower():
+            outsource_shifts.append(s)
+    
+    # Günlük toplam
+    total_inhouse = 0
+    for s in inhouse_shifts:
+        total_inhouse += assignments.get(s, 0)
+    
+    total_outsource = 0
+    for s in outsource_shifts:
+        total_outsource += assignments.get(s, 0)
+    
+    total = total_inhouse + total_outsource
+    
+    # Slot bazında dağılım
+    slot_inhouse = {}
+    slot_outsource = {}
+    
+    for slot in slots:
+        in_count = 0
+        out_count = 0
+        
+        for shift, count in assignments.items():
+            if shift in shift_coverage and slot in shift_coverage[shift]['slots']:
+                if '_inhouse' in shift.lower():
+                    in_count += count
+                else:
+                    out_count += count
+        
+        slot_inhouse[slot] = in_count
+        slot_outsource[slot] = out_count
+    
+    # Zirve slot
+    active_slots = []
+    for s in slots:
+        if need_by_slot.get(s, 0) > 0:
+            active_slots.append(s)
+    
+    if len(active_slots) > 0:
+        max_slot = max(active_slots, key=lambda s: need_by_slot[s])
+        peak_inhouse = slot_inhouse[max_slot]
+        peak_outsource = slot_outsource[max_slot]
+    else:
+        max_slot = None
+        peak_inhouse = 0
+        peak_outsource = 0
+    
+    return {
+        'total': total,
+        'inhouse': total_inhouse,
+        'outsource': total_outsource,
+        'inhouse_pct': total_inhouse / total * 100 if total > 0 else 0,
+        'outsource_pct': total_outsource / total * 100 if total > 0 else 0,
+        'peak_slot': max_slot,
+        'peak_inhouse': peak_inhouse,
+        'peak_outsource': peak_outsource,
+        'slot_inhouse': slot_inhouse,
+        'slot_outsource': slot_outsource,
+        'num_shifts_used': len(assignments)
+    }
+
+
+# =============================================================================
+# 4. KARŞILAŞTIRMA GRAFİK FONKSİYONU
+# =============================================================================
+
+def compare_actual_vs_mip(date, queue, df_actual, assignments, shift_coverage):
+    """Gerçek vs MIP karşılaştırması - 4 grafik"""
+    
+    date_str = pd.to_datetime(date).strftime('%Y-%m-%d')
+    slots = [f"{h:02d}:{m}" for h in range(24) for m in ['00', '30']]
+    
+    # =========================================
+    # GERÇEK VERİLER
+    # =========================================
+    
+    actual_inhouse_start, actual_outsource_start = calculate_actual_by_start_hour(df_actual, date, queue)
+    actual_inhouse_slot, actual_outsource_slot = calculate_actual_by_slot_by_company(df_actual, date, queue)
+    
+    # =========================================
+    # MIP VERİLER
+    # =========================================
+    
+    # Vardiya başlangıç saatlerine göre
+    mip_inhouse_start = {}
+    mip_outsource_start = {}
+    
+    for shift, count in assignments.items():
+        if shift in shift_coverage:
+            info = shift_coverage[shift]
+            start = info['start']
+            
+            if info['company'] == 'inhouse':
+                mip_inhouse_start[start] = mip_inhouse_start.get(start, 0) + count
+            else:
+                mip_outsource_start[start] = mip_outsource_start.get(start, 0) + count
+    
+    # Slot bazında
+    mip_inhouse_slot = {}
+    mip_outsource_slot = {}
+    
+    for slot in slots:
+        count_in = 0
+        count_out = 0
+        
+        for shift, count in assignments.items():
+            if shift in shift_coverage and slot in shift_coverage[shift]['slots']:
+                if shift_coverage[shift]['company'] == 'inhouse':
+                    count_in += count
+                else:
+                    count_out += count
+        
+        mip_inhouse_slot[slot] = count_in
+        mip_outsource_slot[slot] = count_out
+    
+    # =========================================
+    # GRAFİKLER
+    # =========================================
+    
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle(f'Gerçek vs MIP Karşılaştırması - {date_str}', fontsize=14, fontweight='bold')
+    
+    # --- Grafik 1: Inhouse Vardiya Başlangıç ---
+    ax1 = axes[0, 0]
+    all_starts = sorted(set(list(actual_inhouse_start.keys()) + list(mip_inhouse_start.keys())))
+    x_axis = range(len(all_starts))
+    width = 0.35
+    
+    actual_vals = [actual_inhouse_start.get(s, 0) for s in all_starts]
+    mip_vals = [mip_inhouse_start.get(s, 0) for s in all_starts]
+    
+    ax1.bar([i - width/2 for i in x_axis], actual_vals, width, label='Gerçek', color='#2E86AB', alpha=0.7)
+    ax1.bar([i + width/2 for i in x_axis], mip_vals, width, label='MIP', color='#A23B72', alpha=0.7)
+    
+    ax1.set_xlabel('Vardiya Başlangıç Saati')
+    ax1.set_ylabel('Kişi Sayısı')
+    ax1.set_title('INHOUSE - Vardiya Başlangıç Dağılımı')
+    ax1.set_xticks(x_axis)
+    ax1.set_xticklabels(all_starts, rotation=45, ha='right', fontsize=8)
+    ax1.legend()
+    ax1.grid(axis='y', alpha=0.3)
+    
+    # --- Grafik 2: Outsource Vardiya Başlangıç ---
+    ax2 = axes[0, 1]
+    all_starts = sorted(set(list(actual_outsource_start.keys()) + list(mip_outsource_start.keys())))
+    x_axis = range(len(all_starts))
+    
+    actual_vals = [actual_outsource_start.get(s, 0) for s in all_starts]
+    mip_vals = [mip_outsource_start.get(s, 0) for s in all_starts]
+    
+    ax2.bar([i - width/2 for i in x_axis], actual_vals, width, label='Gerçek', color='#2E86AB', alpha=0.7)
+    ax2.bar([i + width/2 for i in x_axis], mip_vals, width, label='MIP', color='#A23B72', alpha=0.7)
+    
+    ax2.set_xlabel('Vardiya Başlangıç Saati')
+    ax2.set_ylabel('Kişi Sayısı')
+    ax2.set_title('OUTSOURCE - Vardiya Başlangıç Dağılımı')
+    ax2.set_xticks(x_axis)
+    ax2.set_xticklabels(all_starts, rotation=45, ha='right', fontsize=8)
+    ax2.legend()
+    ax2.grid(axis='y', alpha=0.3)
+    
+    # --- Grafik 3: Slot Bazında Toplam ---
+    ax3 = axes[1, 0]
+    
+    active_slots = []
+    for s in slots:
+        if actual_inhouse_slot[s] + actual_outsource_slot[s] > 0 or mip_inhouse_slot[s] + mip_outsource_slot[s] > 0:
+            active_slots.append(s)
+    
+    actual_total = [actual_inhouse_slot[s] + actual_outsource_slot[s] for s in active_slots]
+    mip_total = [mip_inhouse_slot[s] + mip_outsource_slot[s] for s in active_slots]
+    
+    ax3.plot(range(len(active_slots)), actual_total, 'o-', label='Gerçek', color='#2E86AB', linewidth=2)
+    ax3.plot(range(len(active_slots)), mip_total, 's--', label='MIP', color='#A23B72', linewidth=2)
+    
+    ax3.set_xlabel('Slot')
+    ax3.set_ylabel('Kişi Sayısı')
+    ax3.set_title('SLOT BAZINDA TOPLAM KİŞİ SAYISI')
+    ax3.set_xticks(range(0, len(active_slots), 4))
+    ax3.set_xticklabels([active_slots[i] for i in range(0, len(active_slots), 4)], rotation=45, ha='right')
+    ax3.legend()
+    ax3.grid(alpha=0.3)
+    
+    # --- Grafik 4: Slot Bazında Inhouse vs Outsource ---
+    ax4 = axes[1, 1]
+    
+    # Gerçek - içi dolu alan
+    ax4.fill_between(range(len(active_slots)), 
+                     [actual_inhouse_slot[s] for s in active_slots],
+                     alpha=0.4, label='Gerçek Inhouse', color='#2E86AB')
+    ax4.fill_between(range(len(active_slots)), 
+                     [actual_outsource_slot[s] for s in active_slots],
+                     alpha=0.4, label='Gerçek Outsource', color='#E94F37')
+    
+    # MIP - kesikli çizgi
+    ax4.plot(range(len(active_slots)), [mip_inhouse_slot[s] for s in active_slots], 
+             '--', label='MIP Inhouse', color='#2E86AB', linewidth=2)
+    ax4.plot(range(len(active_slots)), [mip_outsource_slot[s] for s in active_slots], 
+             '--', label='MIP Outsource', color='#E94F37', linewidth=2)
+    
+    ax4.set_xlabel('Slot')
+    ax4.set_ylabel('Kişi Sayısı')
+    ax4.set_title('SLOT BAZINDA INHOUSE vs OUTSOURCE')
+    ax4.set_xticks(range(0, len(active_slots), 4))
+    ax4.set_xticklabels([active_slots[i] for i in range(0, len(active_slots), 4)], rotation=45, ha='right')
+    ax4.legend()
+    ax4.grid(alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(f'mip_comparison_{date_str}.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    
+    # =========================================
+    # ÖZET TABLO
+    # =========================================
+    
+    total_actual_in = sum(actual_inhouse_start.values())
+    total_actual_out = sum(actual_outsource_start.values())
+    total_mip_in = sum(mip_inhouse_start.values())
+    total_mip_out = sum(mip_outsource_start.values())
+    
+    print(f"\n📊 ÖZET - {date_str}")
+    print(f"{'-'*50}")
+    print(f"{'':20} {'Gerçek':>12} {'MIP':>12}")
+    print(f"{'-'*50}")
+    print(f"{'Inhouse':20} {total_actual_in:>12} {total_mip_in:>12}")
+    print(f"{'Outsource':20} {total_actual_out:>12} {total_mip_out:>12}")
+    print(f"{'TOPLAM':20} {total_actual_in+total_actual_out:>12} {total_mip_in+total_mip_out:>12}")
+    print(f"{'-'*50}")
+    actual_ratio = total_actual_out / (total_actual_in + total_actual_out) * 100 if (total_actual_in + total_actual_out) > 0 else 0
+    mip_ratio = total_mip_out / (total_mip_in + total_mip_out) * 100 if (total_mip_in + total_mip_out) > 0 else 0
+    print(f"{'Outsource Oranı':20} {actual_ratio:>11.1f}% {mip_ratio:>11.1f}%")
+    
+    print(f"\n✓ Grafik kaydedildi: mip_comparison_{date_str}.png")
+
+
+# =============================================================================
+# 5. VERİLERİ HAZIRLA
+# =============================================================================
+
+queue = 'a_cagrilari'
+
+df_eylul = df_actual[df_actual['working_date'].dt.month == 9]
+
+weekend_dates = sorted(df_eylul[
+    (df_eylul['line_based_main_group'] == queue) & 
+    (df_eylul['weekend_flg'] == 1)
+]['working_date'].unique())
+
+print(f"\n{'='*60}")
+print("EYLÜL HAFTA SONU - MIP OPTİMİZASYONU (GRUP BAZLI DENGELEME)")
+print(f"{'='*60}")
+print(f"Hafta sonu günü: {len(weekend_dates)}")
+
+df_shifts_filtered = df_shifts[df_shifts['company'].isin(queue_company_rules[queue])]
+shift_coverage = create_shift_coverage_matrix(df_shifts_filtered)
+
+print(f"\nKullanılabilir Shift: {len(shift_coverage)}")
+print(f"  Inhouse: {sum([1 for s in shift_coverage.values() if s['company']=='inhouse'])}")
+print(f"  Outsource: {sum([1 for s in shift_coverage.values() if s['company']=='outsource'])}")
+
+
+# =============================================================================
+# 6. MIP TESTLERİNİ ÇALIŞTIR
+# =============================================================================
+
+print(f"\n{'='*80}")
+print("MIP OPTİMİZASYON SONUÇLARI")
+print(f"{'='*80}")
+
+# Özel maliyet tanımları
+shift_cost_overrides = {
+    '07:30': {'inhouse': 1.05}
+}
+
+print(f"\n📌 Özel maliyet tanımları:")
+for saat, costs in shift_cost_overrides.items():
+    for company, cost in costs.items():
+        print(f"   {saat} {company}: {cost}")
+
+all_results = []
+
+for date in weekend_dates:
+    date_str = pd.to_datetime(date).strftime('%Y-%m-%d')
+    
+    # İhtiyaç hesapla
+    actual_by_slot = calculate_actual_by_slot(df_actual, date, queue)
+    
+    # MIP çalıştır
+    assignments, status, group_maxes = optimize_shifts_mip(
+        need_by_slot=actual_by_slot,
+        shift_coverage=shift_coverage,
+        target_min_outsource=0.55,
+        target_max_outsource=0.65,
+        min_per_shift=5,
+        cost_inhouse=1.0,
+        cost_outsource=1.01,
+        balance_weight=10,
+        shift_cost_overrides=shift_cost_overrides
+    )
+    
+    if assignments:
+        analysis = analyze_mip_result(assignments, shift_coverage, actual_by_slot)
+        all_results.append({
+            'date': date,
+            'status': status,
+            'assignments': assignments,
+            'analysis': analysis,
+            'group_maxes': group_maxes
+        })
+        print(f"{date_str}: {status} - {analysis['num_shifts_used']} shift, Toplam: {analysis['total']}")
+    else:
+        print(f"{date_str}: {status}")
+
+
+# =============================================================================
+# 7. ÖZET TABLO
+# =============================================================================
+
+print(f"\n{'='*80}")
+print("ÖZET TABLO")
+print(f"{'='*80}")
+
+print(f"\n{'Tarih':<12} {'Toplam':>10} {'Inhouse':>10} {'Outsource':>10} {'Out %':>10} {'Shift #':>10}")
+print(f"{'-'*12} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*10}")
+
+for r in sorted(all_results, key=lambda x: x['date']):
+    date_str = pd.to_datetime(r['date']).strftime('%Y-%m-%d')
+    a = r['analysis']
+    print(f"{date_str:<12} {a['total']:>10} {a['inhouse']:>10} {a['outsource']:>10} {a['outsource_pct']:>9.1f}% {a['num_shifts_used']:>10}")
+
+# Ortalama
+if all_results:
+    avg_outsource = np.mean([r['analysis']['outsource_pct'] for r in all_results])
+    avg_shifts = np.mean([r['analysis']['num_shifts_used'] for r in all_results])
+    print(f"{'-'*12} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*10}")
+    print(f"{'ORTALAMA':<12} {'':<10} {'':<10} {'':<10} {avg_outsource:>9.1f}% {avg_shifts:>10.1f}")
+
+
+# =============================================================================
+# 8. GRUP MAX'LARI
+# =============================================================================
+
+print(f"\n{'='*80}")
+print("GRUP BAZLI DENGELEME - MAX KİŞİ SAYILARI")
+print(f"{'='*80}")
+
+print(f"\n{'Tarih':<12} {'Sabah':>10} {'Gündüz':>10} {'Ara':>10} {'Akşam':>10} {'Gece':>10}")
+print(f"{'-'*12} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*10}")
+
+for r in sorted(all_results, key=lambda x: x['date']):
+    date_str = pd.to_datetime(r['date']).strftime('%Y-%m-%d')
+    gm = r['group_maxes']
+    print(f"{date_str:<12} {gm.get('sabah', 0):>10.0f} {gm.get('gunduz', 0):>10.0f} {gm.get('ara', 0):>10.0f} {gm.get('aksam', 0):>10.0f} {gm.get('gece', 0):>10.0f}")
+
+
+# =============================================================================
+# 9. SHIFT DETAYLARI (İLK 3 GÜN)
+# =============================================================================
+
+print(f"\n{'='*80}")
+print("SHIFT ATAMALARI DETAYI")
+print(f"{'='*80}")
+
+for r in sorted(all_results, key=lambda x: x['date'])[:3]:
+    date_str = pd.to_datetime(r['date']).strftime('%Y-%m-%d')
+    print(f"\n📅 {date_str} - {r['status']}")
+    print(f"{'-'*60}")
+    
+    # Inhouse
+    print("\nINHOUSE:")
+    print(f"   {'Shift':<25} {'Saat':<15} {'Kişi':>10}")
+    print(f"   {'-'*25} {'-'*15} {'-'*10}")
+    for shift, count in sorted(r['assignments'].items()):
+        if '_inhouse' in shift.lower() and shift in shift_coverage:
+            info = shift_coverage[shift]
+            saat = f"{info['start']}-{info['end']}"
+            print(f"   {shift:<25} {saat:<15} {count:>10}")
+    
+    # Outsource
+    print("\nOUTSOURCE:")
+    print(f"   {'Shift':<25} {'Saat':<15} {'Kişi':>10}")
+    print(f"   {'-'*25} {'-'*15} {'-'*10}")
+    for shift, count in sorted(r['assignments'].items()):
+        if '_outsource' in shift.lower() and shift in shift_coverage:
+            info = shift_coverage[shift]
+            saat = f"{info['start']}-{info['end']}"
+            print(f"   {shift:<25} {saat:<15} {count:>10}")
+
+
+# =============================================================================
+# 10. KARŞILAŞTIRMA GRAFİKLERİ
+# =============================================================================
+
+print(f"\n{'='*80}")
+print("KARŞILAŞTIRMA GRAFİKLERİ")
+print(f"{'='*80}")
+
+# Her gün için ekranda göster
+for r in sorted(all_results, key=lambda x: x['date']):
+    compare_actual_vs_mip(
+        date=r['date'],
+        queue=queue,
+        df_actual=df_actual,
+        assignments=r['assignments'],
+        shift_coverage=shift_coverage
+    )
+
+# Tüm günleri tek PNG'ye kaydet
+n_days = len(all_results)
+fig_all, axes_all = plt.subplots(n_days, 4, figsize=(20, 5*n_days))
+
+for idx, r in enumerate(sorted(all_results, key=lambda x: x['date'])):
+    date = r['date']
+    date_str = pd.to_datetime(date).strftime('%Y-%m-%d')
+    assignments = r['assignments']
+    
+    actual_inhouse_start, actual_outsource_start = calculate_actual_by_start_hour(df_actual, date, queue)
+    actual_inhouse_slot, actual_outsource_slot = calculate_actual_by_slot_by_company(df_actual, date, queue)
+    
+    slots = [f"{h:02d}:{m}" for h in range(24) for m in ['00', '30']]
+    
+    mip_inhouse_start = {}
+    mip_outsource_start = {}
+    mip_inhouse_slot = {}
+    mip_outsource_slot = {}
+    
+    for shift, count in assignments.items():
+        if shift in shift_coverage:
+            info = shift_coverage[shift]
+            start = info['start']
+            if info['company'] == 'inhouse':
+                mip_inhouse_start[start] = mip_inhouse_start.get(start, 0) + count
+            else:
+                mip_outsource_start[start] = mip_outsource_start.get(start, 0) + count
+    
+    for slot in slots:
+        count_in = 0
+        count_out = 0
+        for shift, count in assignments.items():
+            if shift in shift_coverage and slot in shift_coverage[shift]['slots']:
+                if shift_coverage[shift]['company'] == 'inhouse':
+                    count_in += count
+                else:
+                    count_out += count
+        mip_inhouse_slot[slot] = count_in
+        mip_outsource_slot[slot] = count_out
+    
+    active_slots = []
+    for s in slots:
+        if actual_inhouse_slot[s] + actual_outsource_slot[s] > 0 or mip_inhouse_slot[s] + mip_outsource_slot[s] > 0:
+            active_slots.append(s)
+    
+    width = 0.35
+    
+    # Grafik 1: Inhouse
+    ax1 = axes_all[idx, 0]
+    all_starts = sorted(set(list(actual_inhouse_start.keys()) + list(mip_inhouse_start.keys())))
+    x_axis = range(len(all_starts))
+    ax1.bar([i - width/2 for i in x_axis], [actual_inhouse_start.get(s, 0) for s in all_starts], width, label='Gerçek', color='#2E86AB', alpha=0.7)
+    ax1.bar([i + width/2 for i in x_axis], [mip_inhouse_start.get(s, 0) for s in all_starts], width, label='MIP', color='#A23B72', alpha=0.7)
+    ax1.set_title(f'{date_str} - Inhouse')
+    ax1.set_xticks(x_axis)
+    ax1.set_xticklabels(all_starts, rotation=45, ha='right', fontsize=6)
+    ax1.legend(fontsize=6)
+    ax1.grid(axis='y', alpha=0.3)
+    
+    # Grafik 2: Outsource
+    ax2 = axes_all[idx, 1]
+    all_starts = sorted(set(list(actual_outsource_start.keys()) + list(mip_outsource_start.keys())))
+    x_axis = range(len(all_starts))
+    ax2.bar([i - width/2 for i in x_axis], [actual_outsource_start.get(s, 0) for s in all_starts], width, label='Gerçek', color='#2E86AB', alpha=0.7)
+    ax2.bar([i + width/2 for i in x_axis], [mip_outsource_start.get(s, 0) for s in all_starts], width, label='MIP', color='#A23B72', alpha=0.7)
+    ax2.set_title(f'{date_str} - Outsource')
+    ax2.set_xticks(x_axis)
+    ax2.set_xticklabels(all_starts, rotation=45, ha='right', fontsize=6)
+    ax2.legend(fontsize=6)
+    ax2.grid(axis='y', alpha=0.3)
+    
+    # Grafik 3: Toplam
+    ax3 = axes_all[idx, 2]
+    ax3.plot(range(len(active_slots)), [actual_inhouse_slot[s] + actual_outsource_slot[s] for s in active_slots], 'o-', label='Gerçek', color='#2E86AB', linewidth=1, markersize=2)
+    ax3.plot(range(len(active_slots)), [mip_inhouse_slot[s] + mip_outsource_slot[s] for s in active_slots], 's--', label='MIP', color='#A23B72', linewidth=1, markersize=2)
+    ax3.set_title(f'{date_str} - Toplam')
+    ax3.set_xticks(range(0, len(active_slots), 6))
+    ax3.set_xticklabels([active_slots[i] for i in range(0, len(active_slots), 6)], rotation=45, ha='right', fontsize=6)
+    ax3.legend(fontsize=6)
+    ax3.grid(alpha=0.3)
+    
+    # Grafik 4: In vs Out
+    ax4 = axes_all[idx, 3]
+    ax4.fill_between(range(len(active_slots)), [actual_inhouse_slot[s] for s in active_slots], alpha=0.4, label='Gerçek In', color='#2E86AB')
+    ax4.fill_between(range(len(active_slots)), [actual_outsource_slot[s] for s in active_slots], alpha=0.4, label='Gerçek Out', color='#E94F37')
+    ax4.plot(range(len(active_slots)), [mip_inhouse_slot[s] for s in active_slots], '--', label='MIP In', color='#2E86AB', linewidth=1)
+    ax4.plot(range(len(active_slots)), [mip_outsource_slot[s] for s in active_slots], '--', label='MIP Out', color='#E94F37', linewidth=1)
+    ax4.set_title(f'{date_str} - In vs Out')
+    ax4.set_xticks(range(0, len(active_slots), 6))
+    ax4.set_xticklabels([active_slots[i] for i in range(0, len(active_slots), 6)], rotation=45, ha='right', fontsize=6)
+    ax4.legend(fontsize=6)
+    ax4.grid(alpha=0.3)
+
+fig_all.tight_layout()
+fig_all.savefig('mip_all_days_comparison.png', dpi=150, bbox_inches='tight')
+plt.close(fig_all)
+
+print(f"\n✓ Tüm günler kaydedildi: mip_all_days_comparison.png")
+print("\n✓ MIP optimizasyonu tamamlandı!")
+
+
+# =============================================================================
+# 11. GRID SEARCH - PARAMETRE OPTİMİZASYONU
+# =============================================================================
+
+print(f"\n{'='*80}")
+print("GRID SEARCH - PARAMETRE OPTİMİZASYONU")
+print(f"{'='*80}")
+
+# Test edilecek parametreler
+param_grid = {
+    'balance_weight': [0, 0.001, 0.01, 0.1, 1, 5, 10],
+    'min_per_shift': [0, 1, 2, 3, 5],
+    'cost_outsource': [1.0, 1.01, 1.05, 1.1]
+}
+
+# Tüm kombinasyonları oluştur
+keys = param_grid.keys()
+combinations = list(itertools.product(*param_grid.values()))
+
+print(f"\nToplam {len(combinations)} kombinasyon test edilecek")
+
+# Sonuçları sakla
+grid_results = []
+
+# Tek bir gün seç (hız için)
+test_date = weekend_dates[0]
+actual_by_slot = calculate_actual_by_slot(df_actual, test_date, queue)
+
+for idx, combo in enumerate(combinations):
+    params = dict(zip(keys, combo))
+    
+    try:
+        assignments, status, group_maxes = optimize_shifts_mip(
+            need_by_slot=actual_by_slot,
+            shift_coverage=shift_coverage,
+            target_min_outsource=0.55,
+            target_max_outsource=0.65,
+            min_per_shift=params['min_per_shift'],
+            cost_inhouse=1.0,
+            cost_outsource=params['cost_outsource'],
+            balance_weight=params['balance_weight'],
+            shift_cost_overrides={}
+        )
+        
+        if assignments:
+            analysis = analyze_mip_result(assignments, shift_coverage, actual_by_slot)
+            
+            # Shift dağılım sapmasını hesapla (standart sapma)
+            shift_counts = list(assignments.values())
+            if len(shift_counts) > 1:
+                std_dev = np.std(shift_counts)
+                mean_count = np.mean(shift_counts)
+                cv = std_dev / mean_count if mean_count > 0 else 0
+            else:
+                std_dev = 0
+                cv = 0
+            
+            grid_results.append({
+                'balance_weight': params['balance_weight'],
+                'min_per_shift': params['min_per_shift'],
+                'cost_outsource': params['cost_outsource'],
+                'num_shifts': len(assignments),
+                'total_people': analysis['total'],
+                'outsource_pct': analysis['outsource_pct'],
+                'std_dev': std_dev,
+                'cv': cv,
+                'status': 'OK'
+            })
+        else:
+            grid_results.append({
+                'balance_weight': params['balance_weight'],
+                'min_per_shift': params['min_per_shift'],
+                'cost_outsource': params['cost_outsource'],
+                'num_shifts': 0,
+                'total_people': 0,
+                'outsource_pct': 0,
+                'std_dev': 0,
+                'cv': 0,
+                'status': status
+            })
+    except Exception as e:
+        grid_results.append({
+            'balance_weight': params['balance_weight'],
+            'min_per_shift': params['min_per_shift'],
+            'cost_outsource': params['cost_outsource'],
+            'num_shifts': 0,
+            'total_people': 0,
+            'outsource_pct': 0,
+            'std_dev': 0,
+            'cv': 0,
+            'status': str(e)
+        })
+    
+    # İlerleme göster
+    if (idx + 1) % 20 == 0:
+        print(f"  {idx + 1}/{len(combinations)} tamamlandı...")
+
+# DataFrame'e çevir
+df_grid = pd.DataFrame(grid_results)
+
+# Sonuçları göster
+print(f"\n{'='*80}")
+print("GRID SEARCH SONUÇLARI")
+print(f"{'='*80}")
+
+# En iyi sonuçlar (düşük std_dev = dengeli dağılım)
+print("\n📊 EN DENGELİ DAĞILIM (düşük std_dev):")
+print(df_grid[df_grid['status'] == 'OK'].nsmallest(10, 'std_dev').to_string(index=False))
+
+# En az shift kullanan
+print("\n📊 EN AZ SHIFT KULLANAN:")
+print(df_grid[df_grid['status'] == 'OK'].nsmallest(10, 'num_shifts').to_string(index=False))
+
+# En az kişi kullanan
+print("\n📊 EN AZ KİŞİ KULLANAN:")
+print(df_grid[df_grid['status'] == 'OK'].nsmallest(10, 'total_people').to_string(index=False))
+
+# CSV'ye kaydet
+df_grid.to_csv('grid_search_results.csv', index=False)
+print(f"\n✓ Sonuçlar kaydedildi: grid_search_results.csv")
+
+print("\n" + "="*80)
+print("TÜM İŞLEMLER TAMAMLANDI!")
+print("="*80)
