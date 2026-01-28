@@ -827,3 +827,72 @@ with pd.ExcelWriter('erlang_mip_karsilastirma.xlsx', engine='openpyxl') as write
 print(f"\n✓ Excel kaydedildi: erlang_mip_karsilastirma.xlsx")
 print(f"  - Detay sheet: {len(df_export)} satır (slot bazlı)")
 print(f"  - Ozet sheet: {len(df_summary)} satır (gün bazlı)")
+
+
+
+
+# =============================================================================
+# 15. SHIFT BAZLI ATAMA DETAYI
+# =============================================================================
+
+print(f"\n{'='*80}")
+print("SHIFT BAZLI ATAMA DETAYI")
+print(f"{'='*80}")
+
+for result in all_results:
+    summary = result['summary']
+    assignments = summary['assignments']
+    shift_coverage = summary['shift_coverage']
+    
+    print(f"\n{'='*60}")
+    print(f"{summary['date']} - Kuyruk {summary['queue']}")
+    print(f"{'='*60}")
+    
+    print(f"\n{'Vardiya':<30} {'Saat':<15} {'Company':<12} {'Kişi':>8}")
+    print(f"{'-'*30} {'-'*15} {'-'*12} {'-'*8}")
+    
+    # Başlangıç saatine göre sırala
+    sorted_shifts = sorted(assignments.items(), 
+                          key=lambda x: shift_coverage[x[0]]['start'] if x[0] in shift_coverage else '99:99')
+    
+    total = 0
+    for shift, count in sorted_shifts:
+        if shift in shift_coverage:
+            info = shift_coverage[shift]
+            saat = f"{info['start']}-{info['end']}"
+            company = info['company']
+            print(f"{shift:<30} {saat:<15} {company:<12} {count:>8}")
+            total += count
+    
+    print(f"{'-'*30} {'-'*15} {'-'*12} {'-'*8}")
+    print(f"{'TOPLAM':<30} {'':<15} {'':<12} {total:>8}")
+
+
+# Excel'e de ekle
+shift_rows = []
+for result in all_results:
+    summary = result['summary']
+    assignments = summary['assignments']
+    shift_coverage = summary['shift_coverage']
+    
+    for shift, count in assignments.items():
+        if shift in shift_coverage:
+            info = shift_coverage[shift]
+            shift_rows.append({
+                'tarih': summary['date'],
+                'kuyruk': summary['queue'],
+                'vardiya': shift,
+                'baslangic': info['start'],
+                'bitis': info['end'],
+                'company': info['company'],
+                'kisi_sayisi': count
+            })
+
+df_shifts_export = pd.DataFrame(shift_rows)
+df_shifts_export = df_shifts_export.sort_values(['tarih', 'kuyruk', 'baslangic']).reset_index(drop=True)
+
+# Mevcut Excel'e yeni sheet ekle
+with pd.ExcelWriter('erlang_mip_karsilastirma.xlsx', engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
+    df_shifts_export.to_excel(writer, sheet_name='Shift_Atama', index=False)
+
+print(f"\n✓ Shift atamaları eklendi: erlang_mip_karsilastirma.xlsx (Shift_Atama sheet)")
