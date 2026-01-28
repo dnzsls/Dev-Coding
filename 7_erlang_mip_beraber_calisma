@@ -1,0 +1,829 @@
+# =============================================================================
+# ERLANG-C + MIP ENTEGRE SİSTEM
+# Çağrı Tahmini → Agent İhtiyacı → Shift Optimizasyonu
+# =============================================================================
+
+import pandas as pd
+import numpy as np
+import math
+import matplotlib.pyplot as plt
+from pulp import *
+import itertools
+
+print("Kütüphaneler yüklendi ✓")
+
+
+# =============================================================================
+# 1. KONFİGÜRASYON
+# =============================================================================
+
+CONFIG = {
+    'aht': {
+        'a': 188,    # a_cagrilari (kitle) için AHT (saniye)
+        'b': 188,    # b_cagrilari (kurumsal) için AHT (saniye)
+        'c': 188     # c_cagrilari (gold) için AHT (saniye)
+    },
+    'target_asa': 30,
+    'target_sl': 0.80,
+    'target_seconds': 30,
+    'shrinkage': 0.10,
+    'interval_minutes': 30,
+}
+
+# Kuyruk-Company kuralları
+queue_company_rules = {
+    'a': ['inhouse', 'outsource'],
+    'b': ['inhouse'],
+    'c': ['inhouse']
+}
+
+# MIP en iyi parametreler (grid search sonucu)
+MIP_PARAMS = {
+    'balance_weight': 0.01,
+    'min_per_shift': 0,
+    'cost_inhouse': 1.0,
+    'cost_outsource': 1.01
+}
+
+print("Konfigürasyon yüklendi ✓")
+print(f"  AHT: a={CONFIG['aht']['a']}sn, b={CONFIG['aht']['b']}sn, c={CONFIG['aht']['c']}sn")
+print(f"  Hedef ASA: {CONFIG['target_asa']}sn")
+print(f"  Shrinkage: %{CONFIG['shrinkage']*100:.0f}")
+
+
+# =============================================================================
+# 2. ERLANG-C FONKSİYONLARI
+# =============================================================================
+
+def erlang_c(agents, traffic):
+    """Erlang C: Kuyrukta bekleme olasılığı"""
+    if agents <= traffic or agents == 0:
+        return 1.0
+    
+    erlang_b = traffic / agents
+    for i in range(2, int(agents) + 1):
+        erlang_b = (traffic * erlang_b) / (i + traffic * erlang_b)
+    
+    erlang_c_val = erlang_b / (1 - (traffic / agents) * (1 - erlang_b))
+    return min(erlang_c_val, 1.0)
+
+
+def calculate_asa(agents, traffic, aht):
+    """ASA hesapla - saniye"""
+    if agents <= traffic or agents == 0:
+        return 999
+    
+    ec = erlang_c(agents, traffic)
+    asa = (ec * (aht / 60)) / (agents - traffic) * 60
+    return asa
+
+
+def calculate_service_level(agents, traffic, aht, target_seconds):
+    """Service Level hesapla"""
+    if agents <= traffic or agents == 0:
+        return 0.0
+    
+    ec = erlang_c(agents, traffic)
+    exp_term = math.exp(-(agents - traffic) * (target_seconds / aht))
+    sl = 1 - (ec * exp_term)
+    return max(0, min(1, sl))
+
+
+def calculate_traffic(calls, interval_min, aht):
+    """Traffic (Erlang) hesapla"""
+    if calls == 0:
+        return 0
+    return (calls * (aht / 60)) / interval_min
+
+
+def find_agents_for_asa(calls, interval_min, aht, target_asa):
+    """ASA hedefi için gereken agent sayısı"""
+    if calls == 0:
+        return 0
+    
+    traffic = calculate_traffic(calls, interval_min, aht)
+    if traffic == 0:
+        return 0
+    
+    min_agents = math.ceil(traffic)
+    max_agents = math.ceil(traffic * 3) + 10
+    
+    for agents in range(min_agents, max_agents + 1):
+        asa = calculate_asa(agents, traffic, aht)
+        if asa <= target_asa:
+            return agents
+    
+    return max_agents
+
+
+def find_optimal_agents(calls, aht, config):
+    """Tek kuyruk için optimal agent (shrinkage dahil)"""
+    if calls == 0:
+        return 0, 0, 0
+    
+    agents_raw = find_agents_for_asa(
+        calls,
+        config['interval_minutes'],
+        aht,
+        config['target_asa']
+    )
+    
+    agents_final = math.ceil(agents_raw / (1 - config['shrinkage']))
+    
+    traffic = calculate_traffic(calls, config['interval_minutes'], aht)
+    final_asa = calculate_asa(agents_raw, traffic, aht) if agents_raw > 0 else 0
+    final_sl = calculate_service_level(agents_raw, traffic, aht, config['target_seconds']) if agents_raw > 0 else 0
+    
+    return agents_final, final_asa, final_sl
+
+print("Erlang-C fonksiyonları tanımlandı ✓")
+
+
+# =============================================================================
+# 3. MIP YARDIMCI FONKSİYONLARI
+# =============================================================================
+
+def is_slot_in_shift(slot, start, end):
+    """Slot bu shift içinde mi?"""
+    if start <= end:
+        return start <= slot < end
+    else:
+        return slot >= start or slot < end
+
+
+def create_shift_coverage_matrix(df_shifts):
+    """Her shift'in hangi slotları kapsadığını hesapla"""
+    shift_coverage = {}
+    
+    for _, row in df_shifts.iterrows():
+        shift = row['shift']
+        start = str(row['start'])[:5]
+        end = str(row['end'])[:5]
+        company = row['company']
+        
+        key = f"{shift}_{company}"
+        
+        slots = []
+        for h in range(24):
+            for m in ['00', '30']:
+                slot = f"{h:02d}:{m}"
+                if is_slot_in_shift(slot, start, end):
+                    slots.append(slot)
+        
+        shift_coverage[key] = {
+            'shift': shift,
+            'company': company,
+            'start': start,
+            'end': end,
+            'slots': slots
+        }
+    
+    return shift_coverage
+
+print("MIP yardımcı fonksiyonları tanımlandı ✓")
+
+
+# =============================================================================
+# 4. MIP OPTİMİZASYON FONKSİYONU
+# =============================================================================
+
+def optimize_shifts_mip(need_by_slot, shift_coverage, 
+                        target_min_outsource=0.55,
+                        target_max_outsource=0.65,
+                        min_per_shift=0,
+                        cost_inhouse=1.0,
+                        cost_outsource=1.01,
+                        balance_weight=0.01,
+                        shift_cost_overrides=None,
+                        only_inhouse=False):
+    """
+    MIP ile shift optimizasyonu
+    """
+    
+    if shift_cost_overrides is None:
+        shift_cost_overrides = {}
+    
+    prob = LpProblem("Shift_Optimization", LpMinimize)
+    
+    shifts = list(shift_coverage.keys())
+    slots = [f"{h:02d}:{m}" for h in range(24) for m in ['00', '30']]
+    active_slots = [s for s in slots if need_by_slot.get(s, 0) > 0]
+    
+    inhouse_shifts = []
+    for s in shifts:
+        if '_inhouse' in s.lower():
+            inhouse_shifts.append(s)
+    
+    outsource_shifts = []
+    for s in shifts:
+        if '_outsource' in s.lower():
+            outsource_shifts.append(s)
+    
+    # Vardiya grupları
+    shift_groups = {
+        'sabah': ['07:00', '07:30', '08:00', '08:30', '09:00'],
+        'gunduz': ['09:30', '10:00', '10:30', '11:00'],
+        'ara': ['11:30', '12:00', '12:30', '13:00', '13:30', '14:00', '14:30', '15:00', '15:30', '16:00', '16:30'],
+        'aksam': ['17:00', '18:00', '19:00'],
+        'gece': ['00:00', '01:00', '02:00', '03:00', '04:00', '05:00', '06:00', '06:30']
+    }
+    
+    group_shifts = {}
+    for group_name, start_hours in shift_groups.items():
+        group_shifts[group_name] = []
+        for s in shifts:
+            if shift_coverage[s]['start'] in start_hours:
+                group_shifts[group_name].append(s)
+    
+    # Değişkenler
+    x = LpVariable.dicts("x", shifts, lowBound=0, cat='Integer')
+    y = LpVariable.dicts("y", shifts, cat='Binary')
+    
+    z_group = {}
+    for group_name in shift_groups.keys():
+        z_group[group_name] = LpVariable(f"z_{group_name}", lowBound=0)
+    
+    # Amaç fonksiyonu
+    cost_list = []
+    for s in shifts:
+        start = shift_coverage[s]['start']
+        company = shift_coverage[s]['company']
+        
+        if company == 'inhouse':
+            base_cost = cost_inhouse
+        else:
+            base_cost = cost_outsource
+        
+        if start in shift_cost_overrides:
+            if company in shift_cost_overrides[start]:
+                base_cost = shift_cost_overrides[start][company]
+        
+        cost_list.append(x[s] * base_cost)
+    
+    total_cost = lpSum(cost_list)
+    balance_penalty = lpSum([z_group[g] for g in shift_groups.keys()])
+    prob += total_cost + balance_weight * balance_penalty
+    
+    # Kısıtlar
+    # 1. Her slotta ihtiyacı karşıla
+    for slot in active_slots:
+        covering_shifts = []
+        for s in shifts:
+            if slot in shift_coverage[s]['slots']:
+                covering_shifts.append(s)
+        
+        if len(covering_shifts) > 0:
+            slot_sum = 0
+            for s in covering_shifts:
+                slot_sum += x[s]
+            prob += slot_sum >= need_by_slot[slot]
+    
+    # 2. Shift min kişi
+    M = 200
+    for s in shifts:
+        prob += x[s] <= M * y[s]
+        prob += x[s] >= min_per_shift * y[s]
+    
+    # 3. Outsource oranı (sadece karma kuyruklar için)
+    if not only_inhouse:
+        total_inhouse = 0
+        for s in inhouse_shifts:
+            total_inhouse += x[s]
+        
+        total_outsource = 0
+        for s in outsource_shifts:
+            total_outsource += x[s]
+        
+        prob += (1 - target_min_outsource) * total_outsource >= target_min_outsource * total_inhouse
+        prob += (1 - target_max_outsource) * total_outsource <= target_max_outsource * total_inhouse
+    
+    # 4. Her slotta en az 1 inhouse
+    for slot in active_slots:
+        covering_inhouse = []
+        for s in inhouse_shifts:
+            if slot in shift_coverage[s]['slots']:
+                covering_inhouse.append(s)
+        
+        if len(covering_inhouse) > 0:
+            inhouse_sum = 0
+            for s in covering_inhouse:
+                inhouse_sum += x[s]
+            prob += inhouse_sum >= 1
+    
+    # 5. Grup dengeleme
+    for group_name, shift_list in group_shifts.items():
+        for s in shift_list:
+            prob += x[s] <= z_group[group_name]
+    
+    # Çözüm
+    prob.solve(PULP_CBC_CMD(msg=0))
+    
+    if LpStatus[prob.status] == 'Optimal':
+        assignments = {}
+        for s in shifts:
+            val = value(x[s])
+            if val and val > 0:
+                assignments[s] = int(val)
+        
+        total_in = 0
+        for s in assignments.keys():
+            if s in inhouse_shifts:
+                total_in += assignments[s]
+        
+        total_out = 0
+        for s in assignments.keys():
+            if s in outsource_shifts:
+                total_out += assignments[s]
+        
+        if (total_in + total_out) > 0:
+            ratio = total_out / (total_in + total_out)
+        else:
+            ratio = 0
+        
+        group_maxes = {}
+        for g in shift_groups.keys():
+            group_maxes[g] = value(z_group[g])
+        
+        return assignments, f"Optimal (outsource: {ratio:.1%})", group_maxes
+    else:
+        return None, LpStatus[prob.status], None
+
+print("MIP optimizasyon fonksiyonu tanımlandı ✓")
+
+
+# =============================================================================
+# 5. VERİ YÜKLEME
+# =============================================================================
+
+print(f"\n{'='*60}")
+print("VERİ YÜKLEME")
+print(f"{'='*60}")
+
+# Shift verisi
+df_shifts = pd.read_excel('vardiyalar.xlsx')
+print(f"Shift tanımları: {len(df_shifts)} satır")
+
+# Çağrı verisi
+df_calls_raw = pd.read_excel('cagri_verisi.xlsx')  # dosya adını güncelle
+df_calls_raw['data_date'] = pd.to_datetime(df_calls_raw['data_date'], dayfirst=True)
+
+# Kolon isimlerini standartlaştır
+df_calls_raw = df_calls_raw.rename(columns={
+    'min_time_period_value': 'time_period',
+    'kitle_nof_call': 'a_nof_call',
+    'kurumsal_nof_call': 'b_nof_call',
+    'gold_nof_call': 'c_nof_call'
+})
+
+print(f"Çağrı verisi: {len(df_calls_raw)} satır")
+
+# Gerçek çalışan verisi
+df_actual = pd.read_excel('gercek_calisanlar.xlsx')
+df_actual['working_date'] = pd.to_datetime(df_actual['working_date'])
+print(f"Gerçek çalışan: {len(df_actual)} satır")
+
+
+# =============================================================================
+# 6. 15DK → 30DK DÖNÜŞÜM
+# =============================================================================
+
+def convert_15_to_30_calls(df_15):
+    """15 dakikalık çağrı verisini 30 dakikalığa çevirir"""
+    df = df_15.copy()
+    df['data_date'] = pd.to_datetime(df['data_date'])
+    
+    df['time_str'] = df['time_period'].astype(str)
+    df['hour'] = df['time_str'].str.split(':').str[0].astype(int)
+    df['minute'] = df['time_str'].str.split(':').str[1].astype(int)
+    
+    df['slot_30'] = df['hour'].astype(str).str.zfill(2) + ':' + \
+                    ((df['minute'] // 30) * 30).astype(str).str.zfill(2)
+    
+    df_30 = df.groupby(['data_date', 'slot_30', 'weekday_flg']).agg({
+        'a_nof_call': 'sum',
+        'b_nof_call': 'sum',
+        'c_nof_call': 'sum'
+    }).reset_index()
+    
+    return df_30.sort_values(['data_date', 'slot_30']).reset_index(drop=True)
+
+df_calls_30 = convert_15_to_30_calls(df_calls_raw)
+
+df_calls_weekend = df_calls_30[df_calls_30['weekday_flg'] == 0].copy()
+df_calls_weekday = df_calls_30[df_calls_30['weekday_flg'] == 1].copy()
+
+print(f"\n15dk → 30dk dönüşüm tamamlandı")
+print(f"  Hafta sonu: {df_calls_weekend['data_date'].nunique()} gün")
+print(f"  Hafta içi: {df_calls_weekday['data_date'].nunique()} gün")
+
+
+# =============================================================================
+# 7. ERLANG HESAPLAMA - 3 KUYRUK
+# =============================================================================
+
+def calculate_erlang_for_all_queues(df_calls, config):
+    """3 kuyruk için Erlang ihtiyacını hesapla"""
+    results = []
+    
+    for _, row in df_calls.iterrows():
+        date = row['data_date']
+        slot = row['slot_30']
+        weekday = row['weekday_flg']
+        
+        for queue in ['a', 'b', 'c']:
+            calls_col = f'{queue}_nof_call'
+            calls = row[calls_col]
+            aht = config['aht'][queue]
+            
+            erlang_need, asa, sl = find_optimal_agents(calls, aht, config)
+            
+            results.append({
+                'data_date': date,
+                'slot': slot,
+                'weekday_flg': weekday,
+                'queue': queue,
+                'calls': int(calls),
+                'erlang_need': erlang_need,
+                'asa': round(asa, 1),
+                'sl': round(sl * 100, 1)
+            })
+    
+    return pd.DataFrame(results)
+
+
+def get_erlang_for_mip(df_erlang, date, queue):
+    """MIP için Erlang çıktısı"""
+    df_day = df_erlang[
+        (df_erlang['data_date'] == date) &
+        (df_erlang['queue'] == queue)
+    ]
+    return dict(zip(df_day['slot'], df_day['erlang_need']))
+
+
+print(f"\n{'='*60}")
+print("ERLANG HESAPLAMA")
+print(f"{'='*60}")
+
+df_erlang_weekend = calculate_erlang_for_all_queues(df_calls_weekend, CONFIG)
+
+for queue in ['a', 'b', 'c']:
+    df_q = df_erlang_weekend[df_erlang_weekend['queue'] == queue]
+    print(f"\nKuyruk {queue.upper()}: Toplam Erlang ihtiyaç = {df_q['erlang_need'].sum():,}")
+
+
+# =============================================================================
+# 8. GERÇEK ÇALIŞAN HESAPLAMA
+# =============================================================================
+
+def calculate_actual_by_slot_queue(df_actual, date, queue):
+    """Belirli gün ve kuyruk için slot bazında gerçek çalışan"""
+    queue_map = {'a': 'a_cagrilari', 'b': 'b_cagrilari', 'c': 'c_cagrilari'}
+    queue_name = queue_map.get(queue, queue)
+    
+    df_day = df_actual[
+        (df_actual['working_date'] == date) &
+        (df_actual['line_based_main_group'] == queue_name)
+    ]
+    
+    slots = [f"{h:02d}:{m}" for h in range(24) for m in ['00', '30']]
+    actual_by_slot = {}
+    
+    for slot in slots:
+        count = 0
+        for _, row in df_day.iterrows():
+            start = str(row['shifts_start_hour'])[:5]
+            end = str(row['shifts_end_hour'])[:5]
+            
+            if is_slot_in_shift(slot, start, end):
+                count += row['calisan_kisi_sayisi']
+        
+        actual_by_slot[slot] = count
+    
+    return actual_by_slot
+
+
+# =============================================================================
+# 9. TAM AKIŞ: ERLANG → MIP → KARŞILAŞTIRMA
+# =============================================================================
+
+def run_full_pipeline(df_erlang, df_actual, df_shifts, date, queue, config, mip_params):
+    """
+    Tek gün, tek kuyruk için tam akış:
+    1. Erlang ihtiyacı al
+    2. MIP ile shift optimizasyonu
+    3. Gerçek ile karşılaştır
+    """
+    
+    date_str = pd.to_datetime(date).strftime('%Y-%m-%d')
+    
+    # 1. Erlang ihtiyacı
+    erlang_by_slot = get_erlang_for_mip(df_erlang, date, queue)
+    
+    # 2. Shift coverage hazırla
+    only_inhouse = (queue_company_rules[queue] == ['inhouse'])
+    allowed_companies = queue_company_rules[queue]
+    df_shifts_filtered = df_shifts[df_shifts['company'].isin(allowed_companies)]
+    shift_coverage = create_shift_coverage_matrix(df_shifts_filtered)
+    
+    # 3. Maliyet ayarları
+    if queue == 'a':
+        shift_cost_overrides = {'07:30': {'inhouse': 1.05}}
+    else:
+        shift_cost_overrides = {}
+    
+    # 4. MIP çalıştır
+    assignments, status, group_maxes = optimize_shifts_mip(
+        need_by_slot=erlang_by_slot,
+        shift_coverage=shift_coverage,
+        target_min_outsource=0.55,
+        target_max_outsource=0.65,
+        min_per_shift=mip_params['min_per_shift'],
+        cost_inhouse=mip_params['cost_inhouse'],
+        cost_outsource=mip_params['cost_outsource'],
+        balance_weight=mip_params['balance_weight'],
+        shift_cost_overrides=shift_cost_overrides,
+        only_inhouse=only_inhouse
+    )
+    
+    if assignments is None:
+        return None
+    
+    # 5. MIP sonucunu slot bazına çevir
+    slots = [f"{h:02d}:{m}" for h in range(24) for m in ['00', '30']]
+    mip_by_slot = {}
+    for slot in slots:
+        count = 0
+        for shift, cnt in assignments.items():
+            if shift in shift_coverage and slot in shift_coverage[shift]['slots']:
+                count += cnt
+        mip_by_slot[slot] = count
+    
+    # 6. Gerçek çalışan
+    actual_by_slot = calculate_actual_by_slot_queue(df_actual, date, queue)
+    
+    # 7. Karşılaştırma tablosu
+    results = []
+    for slot in slots:
+        erlang = erlang_by_slot.get(slot, 0)
+        mip = mip_by_slot.get(slot, 0)
+        actual = actual_by_slot.get(slot, 0)
+        
+        if erlang > 0 or mip > 0 or actual > 0:
+            results.append({
+                'slot': slot,
+                'erlang': erlang,
+                'mip': mip,
+                'actual': actual,
+                'mip_vs_erlang': mip - erlang,
+                'actual_vs_erlang': actual - erlang,
+                'actual_vs_mip': actual - mip
+            })
+    
+    df_compare = pd.DataFrame(results)
+    
+    # 8. Özet
+    summary = {
+        'date': date_str,
+        'queue': queue.upper(),
+        'erlang_total': sum(erlang_by_slot.values()),
+        'mip_total': sum(mip_by_slot.values()),
+        'actual_total': sum(actual_by_slot.values()),
+        'mip_status': status,
+        'num_shifts': len(assignments),
+        'assignments': assignments,
+        'shift_coverage': shift_coverage
+    }
+    
+    return {
+        'summary': summary,
+        'comparison': df_compare,
+        'erlang_by_slot': erlang_by_slot,
+        'mip_by_slot': mip_by_slot,
+        'actual_by_slot': actual_by_slot
+    }
+
+
+# =============================================================================
+# 10. KARŞILAŞTIRMA GRAFİĞİ
+# =============================================================================
+
+def plot_three_way_comparison(result, save=True):
+    """Erlang vs MIP vs Gerçek karşılaştırma grafiği"""
+    
+    df = result['comparison']
+    summary = result['summary']
+    
+    if len(df) == 0:
+        print("Veri yok!")
+        return
+    
+    date_str = summary['date']
+    queue = summary['queue']
+    
+    fig, axes = plt.subplots(2, 1, figsize=(18, 12))
+    
+    # Üst grafik: 3'lü karşılaştırma
+    x = range(len(df))
+    width = 0.25
+    
+    axes[0].bar([i - width for i in x], df['erlang'], width, 
+                label='Erlang Tahmin', color='steelblue', alpha=0.7)
+    axes[0].bar([i for i in x], df['mip'], width,
+                label='MIP Optimizasyon', color='forestgreen', alpha=0.7)
+    axes[0].bar([i + width for i in x], df['actual'], width,
+                label='Gerçek', color='coral', alpha=0.7)
+    
+    axes[0].set_xlabel('Slot')
+    axes[0].set_ylabel('Agent Sayısı')
+    axes[0].set_title(f'Kuyruk {queue} - {date_str} - Erlang vs MIP vs Gerçek')
+    axes[0].set_xticks(x)
+    axes[0].set_xticklabels(df['slot'], rotation=45, ha='right', fontsize=8)
+    axes[0].legend()
+    axes[0].grid(axis='y', alpha=0.3)
+    
+    # Alt grafik: Farklar
+    axes[1].plot(x, df['mip_vs_erlang'], 'g-o', label='MIP - Erlang', markersize=4)
+    axes[1].plot(x, df['actual_vs_erlang'], 'r-s', label='Gerçek - Erlang', markersize=4)
+    axes[1].axhline(y=0, color='black', linestyle='--', linewidth=0.5)
+    
+    axes[1].set_xlabel('Slot')
+    axes[1].set_ylabel('Fark')
+    axes[1].set_title(f'Kuyruk {queue} - {date_str} - Farklar')
+    axes[1].set_xticks(x)
+    axes[1].set_xticklabels(df['slot'], rotation=45, ha='right', fontsize=8)
+    axes[1].legend()
+    axes[1].grid(alpha=0.3)
+    
+    plt.tight_layout()
+    
+    if save:
+        plt.savefig(f'comparison_{queue}_{date_str}.png', dpi=150, bbox_inches='tight')
+    
+    plt.show()
+    
+    # Özet tablo
+    print(f"\n📊 ÖZET - {date_str} - Kuyruk {queue}")
+    print(f"{'-'*50}")
+    print(f"{'Metrik':<25} {'Değer':>15}")
+    print(f"{'-'*50}")
+    print(f"{'Erlang Toplam':<25} {summary['erlang_total']:>15}")
+    print(f"{'MIP Toplam':<25} {summary['mip_total']:>15}")
+    print(f"{'Gerçek Toplam':<25} {summary['actual_total']:>15}")
+    print(f"{'MIP - Erlang':<25} {summary['mip_total'] - summary['erlang_total']:>+15}")
+    print(f"{'Gerçek - Erlang':<25} {summary['actual_total'] - summary['erlang_total']:>+15}")
+    print(f"{'Kullanılan Shift':<25} {summary['num_shifts']:>15}")
+    print(f"{'MIP Status':<25} {summary['mip_status']:>15}")
+
+
+# =============================================================================
+# 11. TÜM GÜNLER VE KUYRUKLAR İÇİN ÇALIŞTIR
+# =============================================================================
+
+print(f"\n{'='*80}")
+print("TAM AKIŞ: ERLANG → MIP → KARŞILAŞTIRMA")
+print(f"{'='*80}")
+
+# Test için ilk 2 hafta sonu günü
+test_dates = df_calls_weekend['data_date'].unique()[:2]
+
+all_results = []
+
+for date in test_dates:
+    date_str = pd.to_datetime(date).strftime('%Y-%m-%d')
+    print(f"\n{'='*60}")
+    print(f"TARİH: {date_str}")
+    print(f"{'='*60}")
+    
+    for queue in ['a', 'b', 'c']:
+        print(f"\n--- Kuyruk {queue.upper()} ---")
+        
+        result = run_full_pipeline(
+            df_erlang=df_erlang_weekend,
+            df_actual=df_actual,
+            df_shifts=df_shifts,
+            date=date,
+            queue=queue,
+            config=CONFIG,
+            mip_params=MIP_PARAMS
+        )
+        
+        if result:
+            all_results.append(result)
+            s = result['summary']
+            print(f"  Erlang: {s['erlang_total']}, MIP: {s['mip_total']}, Gerçek: {s['actual_total']}")
+            print(f"  Status: {s['mip_status']}, Shift: {s['num_shifts']}")
+        else:
+            print(f"  HATA: MIP çözüm bulunamadı")
+
+
+# =============================================================================
+# 12. ÖZET TABLO
+# =============================================================================
+
+print(f"\n{'='*80}")
+print("ÖZET TABLO - TÜM GÜNLER VE KUYRUKLAR")
+print(f"{'='*80}")
+
+print(f"\n{'Tarih':<12} {'Kuyruk':<8} {'Erlang':>10} {'MIP':>10} {'Gerçek':>10} {'MIP-Erl':>10} {'Ger-Erl':>10}")
+print(f"{'-'*80}")
+
+for result in all_results:
+    s = result['summary']
+    mip_diff = s['mip_total'] - s['erlang_total']
+    actual_diff = s['actual_total'] - s['erlang_total']
+    print(f"{s['date']:<12} {s['queue']:<8} {s['erlang_total']:>10} {s['mip_total']:>10} {s['actual_total']:>10} {mip_diff:>+10} {actual_diff:>+10}")
+
+
+# =============================================================================
+# 13. GRAFİKLER
+# =============================================================================
+
+print(f"\n{'='*80}")
+print("KARŞILAŞTIRMA GRAFİKLERİ")
+print(f"{'='*80}")
+
+for result in all_results:
+    plot_three_way_comparison(result)
+
+
+print(f"\n{'='*80}")
+print("İŞLEM TAMAMLANDI!")
+print(f"{'='*80}")
+
+
+
+
+# =============================================================================
+# 14. SONUÇLARI EXCEL'E KAYDET
+# =============================================================================
+
+print(f"\n{'='*80}")
+print("EXCEL'E KAYDETME")
+print(f"{'='*80}")
+
+# Tüm sonuçları birleştir
+all_rows = []
+
+for result in all_results:
+    summary = result['summary']
+    df_compare = result['comparison']
+    
+    for _, row in df_compare.iterrows():
+        all_rows.append({
+            'tarih': summary['date'],
+            'kuyruk': summary['queue'],
+            'slot': row['slot'],
+            'erlang_tahmin': row['erlang'],
+            'mip_optimizasyon': row['mip'],
+            'gercek': row['actual'],
+            'mip_erlang_fark': row['mip_vs_erlang'],
+            'gercek_erlang_fark': row['actual_vs_erlang'],
+            'gercek_mip_fark': row['actual_vs_mip']
+        })
+
+df_export = pd.DataFrame(all_rows)
+
+# Sırala
+df_export = df_export.sort_values(['tarih', 'kuyruk', 'slot']).reset_index(drop=True)
+
+# Excel'e kaydet
+df_export.to_excel('erlang_mip_karsilastirma.xlsx', index=False)
+
+print(f"✓ {len(df_export)} satır kaydedildi: erlang_mip_karsilastirma.xlsx")
+print(f"\nKolonlar:")
+print(f"  - tarih")
+print(f"  - kuyruk")
+print(f"  - slot")
+print(f"  - erlang_tahmin")
+print(f"  - mip_optimizasyon")
+print(f"  - gercek")
+print(f"  - mip_erlang_fark")
+print(f"  - gercek_erlang_fark")
+print(f"  - gercek_mip_fark")
+
+# Özet de ayrı sheet'e kaydet
+summary_rows = []
+for result in all_results:
+    s = result['summary']
+    summary_rows.append({
+        'tarih': s['date'],
+        'kuyruk': s['queue'],
+        'erlang_toplam': s['erlang_total'],
+        'mip_toplam': s['mip_total'],
+        'gercek_toplam': s['actual_total'],
+        'mip_erlang_fark': s['mip_total'] - s['erlang_total'],
+        'gercek_erlang_fark': s['actual_total'] - s['erlang_total'],
+        'shift_sayisi': s['num_shifts'],
+        'mip_status': s['mip_status']
+    })
+
+df_summary = pd.DataFrame(summary_rows)
+
+# İki sheet'li Excel
+with pd.ExcelWriter('erlang_mip_karsilastirma.xlsx', engine='openpyxl') as writer:
+    df_export.to_excel(writer, sheet_name='Detay', index=False)
+    df_summary.to_excel(writer, sheet_name='Ozet', index=False)
+
+print(f"\n✓ Excel kaydedildi: erlang_mip_karsilastirma.xlsx")
+print(f"  - Detay sheet: {len(df_export)} satır (slot bazlı)")
+print(f"  - Ozet sheet: {len(df_summary)} satır (gün bazlı)")
